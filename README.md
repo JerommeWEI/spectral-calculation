@@ -1,8 +1,8 @@
 # Spectral Calculation - 光谱重建算法项目
 
-**版本**: v1.2  
+**版本**: v1.3  
 **作者**: UNS-JeromeWei  
-**日期**: 2026-05-08
+**日期**: 2026-06-23
 
 ---
 
@@ -22,6 +22,9 @@ spectral calculation/
 │   ├── rebuild_curves_cwl_fwhm_loop.py           # 主算法实现文件
 │   ├── rebuild_curves_cwl_fwhm_loop_20260503.py  # 算法版本备份
 │   ├── rebuild_curves_cwl_fwhm_loop_analysis.md  # 算法详细解析文档
+│   ├── roi_reflectance_eval.py                   # ENVI raw ROI 信号/CWL/FWHM GUI 工具
+│   ├── roi_reflectance_eval.pyw                  # 无控制台窗口 GUI 入口
+│   ├── algorithm_changes_report.html             # ROI 信号处理算法变化说明
 │   ├── tmp/                                      # 临时测试文件目录
 │   │   ├── rebuild_curves_2_peak_new_uc450_260417.py
 │   │   ├── rebuild_curves_2_peak_400_1000nm.py
@@ -70,7 +73,44 @@ spectral calculation/
 - PyTorch优化器方法
 - 二阶差分平滑约束
 
-### 2. 数学模型
+### 2. ROI 信号评估 GUI
+
+**文件**: `spectral_cal/roi_reflectance_eval.py`  
+**无黑框入口**: `spectral_cal/roi_reflectance_eval.pyw`
+
+**主要功能**:
+- 读取 ENVI `.hdr/.raw` 数据目录，自动识别 `*-Rec`、`*-Ref`、`*-Dark` 数据组
+- 当前曲线和 CWL/FWHM 评估直接基于 `Sign/Rec` 信号，不再做 `Sign/Ref` 或 Dark 扣减
+- 支持手动画多个矩形 ROI，并支持 `Auto 5x5` 自动 ROI 划分
+- 左侧显示 CWL drift map：每个像素取 Sign 光谱峰值对应的波长
+- 右侧显示 ROI Sign 光谱曲线，并计算 CWL、FWHM、峰值置信度、次峰比例
+- CSV/PNG 导出 ROI 光谱、质量状态和峰值诊断指标
+- GUI 后台计算 CWL drift map，避免加载大数据时窗口无响应
+- 自动配置中文字体，避免中文路径在 GUI/PNG 中乱码
+
+**信噪比增强策略**:
+- ROI 曲线使用 trimmed mean，默认去除 ROI 内最高/最低各 5% 像素后再平均
+- 每个 ROI 输出 `peak_confidence`、`peak_prominence`、`secondary_peak_ratio`
+- 当次峰接近主峰时标记为 `ambiguous_peak`，避免误判不稳定 CWL
+- CWL drift map 使用 3x3 中值滤波，并自适应保留当前数据主导峰邻域
+- Sign-only CWL map 使用快速 argmax 路径，典型加载速度约提升 5 倍
+
+**运行示例**:
+```bash
+python spectral_cal/roi_reflectance_eval.py
+```
+
+Windows 下如需避免控制台黑框，可直接运行:
+```bash
+pythonw spectral_cal/roi_reflectance_eval.pyw
+```
+
+批处理自动 5x5 ROI:
+```bash
+python spectral_cal/roi_reflectance_eval.py --no-gui --auto-grid --output roi_signal_stats.csv
+```
+
+### 3. 数学模型
 
 #### 线性模型
 ```
@@ -200,6 +240,7 @@ scipy              # 科学计算（插值、优化、滤波）
 matplotlib         # 可视化
 pandas             # 数据处理
 spectral           # 光谱数据处理
+tkinter            # GUI 文件选择
 ```
 
 ---
@@ -231,6 +272,27 @@ spectral           # 光谱数据处理
 ---
 
 ## 版本历史
+
+### v1.3 (2026-06-23)
+- **新增 ROI 信号评估 GUI**
+  - 新增 `spectral_cal/roi_reflectance_eval.py` 和无黑框入口 `roi_reflectance_eval.pyw`
+  - 支持 ENVI `.hdr/.raw` 数据读取，自动识别 `Rec/Ref/Dark` 数据目录
+  - 支持多 ROI 手动画框、`Auto 5x5` 自动划分、CSV/PNG 导出
+- **Sign-only 信号处理流程**
+  - 曲线、CWL drift map、CWL/FWHM 指标直接基于 `Sign/Rec` 信号
+  - 保留 Dark 作为噪声门限参考，但不再执行 Dark 扣减或 `Sign/Ref` 归一化
+- **CWL/FWHM 与质量诊断**
+  - 每个 ROI 自动计算 CWL、FWHM、主峰、次峰比例、峰值置信度
+  - 新增 `ambiguous_peak` 状态，用于标记主峰与次峰接近的低可信 ROI
+  - CSV 增加 `peak_confidence`、`peak_prominence`、`background_level`、`background_noise` 等诊断字段
+- **展示信噪比增强**
+  - ROI 曲线使用 trimmed mean，降低坏点和边缘异常点影响
+  - CWL drift map 增加空间中值滤波和自适应主导峰窗口
+  - 后台计算 CWL drift map，避免 GUI 加载期间无响应
+- **工程体验优化**
+  - 默认数据目录支持自动解析，兼容中文路径和实际数据目录层级变化
+  - GUI 统一主题、按钮布局、中文字体和 CWL/FWHM 汇总信息框
+  - 新增 `algorithm_changes_report.html` 记录 ROI 算法变化说明
 
 ### v1.2 (2026-05-08)
 - **新增连续光谱重建功能**

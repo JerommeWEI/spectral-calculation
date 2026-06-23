@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>反射率算法处理变化说明</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #eef2f6;
+      --panel: #ffffff;
+      --panel-soft: #f8fafc;
+      --text: #17202a;
+      --muted: #5f6b7a;
+      --line: #d8e1ea;
+      --accent: #2f6f9f;
+      --accent-dark: #1f526f;
+      --accent-soft: #e8f2f8;
+      --ok: #0f766e;
+      --warn-soft: #fff7df;
+      --warn: #946200;
+      --code-bg: #edf1f5;
+      --code: #111827;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+      line-height: 1.65;
+    }
+
+    main {
+      width: min(1160px, calc(100% - 48px));
+      margin: 34px auto 56px;
+    }
+
+    header {
+      margin-bottom: 22px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 30px;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      letter-spacing: 0;
+    }
+
+    .summary {
+      margin: 0;
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 18px;
+    }
+
+    .meta-card,
+    .formula,
+    .note,
+    .flow,
+    .params {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .meta-card {
+      padding: 12px 14px;
+      color: var(--muted);
+    }
+
+    .meta-card strong {
+      color: var(--text);
+    }
+
+    .formula {
+      margin: 18px 0 0;
+      padding: 16px 18px;
+    }
+
+    code {
+      color: var(--code);
+      background: var(--code-bg);
+      border-radius: 4px;
+      padding: 2px 5px;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 0.95em;
+    }
+
+    .flow,
+    .params {
+      margin-top: 16px;
+      padding: 16px 18px;
+    }
+
+    .flow ol {
+      margin: 8px 0 0;
+      padding-left: 24px;
+    }
+
+    .params table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 14px;
+    }
+
+    .params th,
+    .params td {
+      text-align: left;
+      border-bottom: 1px solid var(--line);
+      padding: 8px 10px;
+      vertical-align: top;
+    }
+
+    .params th {
+      color: var(--accent-dark);
+      background: var(--accent-soft);
+    }
+
+    .change-list {
+      display: grid;
+      gap: 16px;
+      margin-top: 24px;
+    }
+
+    .item {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .item h2 {
+      margin: 0;
+      padding: 14px 18px;
+      font-size: 19px;
+      background: var(--accent-soft);
+      color: var(--accent-dark);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .content {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+    }
+
+    .before,
+    .after {
+      padding: 16px 18px;
+    }
+
+    .before {
+      border-right: 1px solid var(--line);
+    }
+
+    .label {
+      display: inline-block;
+      margin-bottom: 8px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+
+    .improvement {
+      padding: 14px 18px 16px;
+      border-top: 1px solid var(--line);
+      background: var(--panel-soft);
+    }
+
+    .improvement strong {
+      color: var(--ok);
+    }
+
+    .note {
+      margin-top: 24px;
+      padding: 16px 18px;
+      background: var(--warn-soft);
+      border-color: #efd08a;
+      color: var(--warn);
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    @media (max-width: 860px) {
+      main {
+        width: min(100% - 28px, 1160px);
+        margin-top: 24px;
+      }
+
+      .meta,
+      .content {
+        grid-template-columns: 1fr;
+      }
+
+      .before {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>反射率算法处理变化说明</h1>
+      <p class="summary">
+        本报告覆盖当前代码中的实际算法逻辑，汇总从最开始的简单比值计算，到后续为信噪比、孤立噪声、ROI 统计、CWL/FWHM 指标所做的完整变化。
+      </p>
+
+      <div class="meta">
+        <div class="meta-card"><strong>代码文件：</strong><code>test/roi_reflectance_eval.py</code></div>
+        <div class="meta-card"><strong>更新日期：</strong>2026-06-22</div>
+        <div class="meta-card"><strong>默认数据路径：</strong><code>F:\05-Jerome Studios\计算光谱专项\测试数据\003</code></div>
+        <div class="meta-card"><strong>核心原则：</strong>关键处理放在除法前的原始差分信号阶段，不在最终曲线上做隐藏或伪修正。</div>
+      </div>
+
+      <div class="formula">
+        <strong>最开始的核心公式：</strong>
+        <code>Reflectance = (Sign - Dark) / (Ref - Dark)</code>
+      </div>
+
+      <section class="flow">
+        <strong>当前完整处理流程：</strong>
+        <ol>
+          <li>读取 <code>*-Rec</code>、<code>*-Ref</code>、<code>*-Dark</code> 的 ENVI <code>.hdr/.raw</code> 数据，并检查尺寸与波长轴一致。</li>
+          <li>对每个波段先计算 <code>Signal = Sign - Dark</code>、<code>RefSignal = Ref - Dark</code>。</li>
+          <li>在原始差分图像上进行空间高斯滤波，默认 <code>spatial_sigma = 0.8</code>。</li>
+          <li>如果 <code>Signal &lt; 0</code> 或 <code>RefSignal &lt; 0</code>，该像素反射率置为 <code>0</code>，不进入除法。</li>
+          <li>用 <code>dark_std</code> 估计噪声，要求 <code>Signal</code> 与 <code>RefSignal</code> 都大于 <code>max(eps, snr * dark_std)</code>。</li>
+          <li>对通过门限的有效像素做连通域过滤，默认至少 <code>8</code> 个相邻像素才保留。</li>
+          <li>仅对保留下来的有效像素执行除法；低信噪比或孤立点输出 <code>0</code>，并记录质量字段。</li>
+          <li>ROI 光谱默认使用 <code>mean(Signal_valid) / mean(RefSignal_valid)</code> 作为均值反射率。</li>
+          <li>对每个 ROI 的光谱计算主峰、CWL、FWHM、次峰比例和小峰数量。</li>
+        </ol>
+      </section>
+
+      <section class="params">
+        <strong>当前默认关键参数：</strong>
+        <table>
+          <thead>
+            <tr>
+              <th>参数</th>
+              <th>默认值</th>
+              <th>作用</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>eps</code></td>
+              <td><code>5.0</code></td>
+              <td>Signal/RefSignal 的绝对最低有效门限。</td>
+            </tr>
+            <tr>
+              <td><code>snr</code></td>
+              <td><code>3.0</code></td>
+              <td>相对暗噪声标准差的最低信噪比倍数。</td>
+            </tr>
+            <tr>
+              <td><code>spatial_sigma</code></td>
+              <td><code>0.8</code></td>
+              <td>除法前对 Signal 和 RefSignal 做空间高斯滤波的强度。</td>
+            </tr>
+            <tr>
+              <td><code>min_valid_fraction</code></td>
+              <td><code>0.05</code></td>
+              <td>ROI 中至少需要多少比例像素真正参与除法，才认为该波段质量足够。</td>
+            </tr>
+            <tr>
+              <td><code>min_division_pixels</code></td>
+              <td><code>30</code></td>
+              <td>ROI 中实际参与除法的最少像素数。</td>
+            </tr>
+            <tr>
+              <td><code>min_component_pixels</code></td>
+              <td><code>8</code></td>
+              <td>通过 SNR 门限的像素必须形成至少 8 个相邻像素的连通区域，孤立点不参与除法。</td>
+            </tr>
+            <tr>
+              <td><code>Auto 5x5</code></td>
+              <td><code>5 x 5</code>，每块面积 <code>30%</code></td>
+              <td>自动生成 25 个中心矩形 ROI，并行计算每个 ROI 的光谱与指标。</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+    </header>
+
+    <section class="change-list">
+      <article class="item">
+        <h2>1. 从直接比值改为先构造 Signal 与 RefSignal</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前</span>
+            <p>直接把 <code>Sign - Dark</code> 与 <code>Ref - Dark</code> 放进比值公式，缺少中间信号质量判断。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>先明确计算 <code>Signal = Sign - Dark</code> 和 <code>RefSignal = Ref - Dark</code>，负数、SNR、连通域等判断都发生在这两个原始差分信号上。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>每个像素是否可信可以追溯到原始信号层，而不是只看最终反射率比值。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>2. 差分后负数前置归零，不参与除法</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前</span>
+            <p>如果 <code>Sign - Dark</code> 或 <code>Ref - Dark</code> 出现负数，可能继续进入除法，得到负反射率或异常比值。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>只要 <code>Signal &lt; 0</code> 或 <code>RefSignal &lt; 0</code>，该像素输出 <code>0</code>，并记录到 <code>negative_signal_count</code>、<code>negative_ref_signal_count</code>、<code>prezero_count</code>。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>避免暗噪声扣除后的负值被除法放大成物理上不合理的结果。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>3. 在原始差分图像上加入空间高斯滤波</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前</span>
+            <p>每个像素直接用原始差分值计算，局部坏点、随机噪声和孤立尖点会影响 ROI 平均。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>在除法前，对 <code>Signal</code> 和 <code>RefSignal</code> 做空间高斯滤波，默认 <code>spatial_sigma = 0.8</code>；不对最终光谱曲线做高斯滤波。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>从原始图像层降低空间随机噪声，减少孤立坏点对后续除法和 ROI 统计的影响。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>4. ROI 计算增加 padding，避免滤波边界误差</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前</span>
+            <p>如果只截取 ROI 内部再做滤波，ROI 边缘像素会缺少邻域信息，边界区域可能被人为影响。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>对 ROI 按 <code>3 * spatial_sigma</code> 自动扩展计算区域，先在扩展区域完成滤波和质量判断，再裁回用户选定的 ROI。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>ROI 边缘的信号处理更接近整幅图像计算结果，减少边界效应。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>5. 增加基于 Dark 标准差的双 SNR 门限</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前</span>
+            <p>只要分母 <code>Ref - Dark</code> 大于 0，就可能参与除法；分母很小时，噪声会被放大成假峰。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>用 <code>dark_std</code> 估计噪声，要求 <code>Signal</code> 和 <code>RefSignal</code> 同时大于 <code>max(eps, snr * dark_std)</code>，默认 <code>eps = 5</code>、<code>snr = 3</code>。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>同时抑制低 Signal 和低 RefSignal 区域，减少小分母和低信噪比造成的异常尖峰。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>6. 新增连通域过滤，去掉孤立有效点</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前</span>
+            <p>有些孤立像素可能刚好超过 SNR 门限，虽然数量很少，但进入除法后会在某些波段形成杂峰。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>通过 SNR 门限的像素还必须形成连通区域，默认至少 <code>8</code> 个相邻像素才保留；孤立小块被归入低 SNR，不参与除法。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>这是后续为 830 nm 数据前半段杂峰新增的关键算法处理，可以去掉随机孤立点造成的假峰，同时不针对固定波长写死规则。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>7. ROI 均值改为 ratio-of-means</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前</span>
+            <p>更接近逐像素计算 <code>Signal / RefSignal</code> 后再平均，少量异常小分母像素会明显拉高 ROI 结果。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>先筛选真正通过门限和连通域过滤的有效像素，再计算 <code>mean(Signal_valid) / mean(RefSignal_valid)</code>。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>ROI 光谱均值更稳定，不容易被单个或少数异常像素带歪。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>8. 增加有效除法像素数量与比例约束</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前</span>
+            <p>只要有少量有效像素，就可能输出一个看似正常的 ROI 反射率。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>每个 ROI、每个波段都会计算 <code>division_pixel_count</code> 和 <code>division_fraction</code>。默认至少 <code>30</code> 个像素且比例不低于 <code>5%</code>，才被认为质量足够。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>防止少量像素支撑整段波长结果，降低偶然噪声造成的假峰风险。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>9. 低质量波段保留在完整曲线上，但输出为 0</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前尝试过但已撤销</span>
+            <p>曾尝试用视觉标记或 mask 来区分异常波段，这会让曲线看起来像被隐藏或被人为修饰。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>横坐标完整显示全部波长。如果某个波段在原始差分信号阶段没有足够可靠的有效像素，该波段 <code>mean_reflectance</code> 输出 <code>0</code>，同时 <code>metric_mean_reflectance</code> 为 <code>NaN</code>，并用 <code>quality_status</code> 说明原因。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>不遮住波长范围，也不在除法后平滑或裁剪；低质量结果用数据质量逻辑表达为无可靠反射率。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>10. CSV 增加完整质量诊断字段</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前</span>
+            <p>CSV 主要输出反射率结果，难以判断异常来自负值、低 Signal、低 RefSignal、孤立像素还是有效像素不足。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>CSV 增加 <code>valid_fraction</code>、<code>division_fraction</code>、<code>quality_status</code>、<code>low_snr_count</code>、<code>low_signal_snr_count</code>、<code>low_ref_snr_count</code>、<code>negative_signal_count</code>、<code>negative_ref_signal_count</code>、<code>prezero_count</code>、<code>dark_std</code>、<code>signal_threshold</code>、<code>ref_threshold</code>、<code>signal_mean</code>、<code>ref_signal_mean</code>、<code>min_component_pixels</code> 等字段。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>每个波段都可以复查为什么被保留、为什么归零、为什么不参与指标计算。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>11. artifact range 保留为标记，不再改变数据</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前讨论</span>
+            <p>针对 500 到 600 nm 异常波形，曾考虑过显示层 mask 或特殊范围处理，但这种方式容易丢失信息。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p><code>artifact_mode = mark</code> 只写入 <code>artifact_status</code> 标记，不改变 <code>mean_reflectance</code>、不裁剪曲线、不隐藏波段。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>异常波长范围仍可追踪，但不再通过固定波长规则修改真实计算结果，避免针对某个主波长或固定区间过拟合。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>12. CWL 与 FWHM 改为基于主峰半高点计算</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前</span>
+            <p>只输出 ROI 曲线，没有直接量化主峰中心波长和半高宽。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>先找主峰，再以主峰高度的一半作为半高，左右两侧通过线性插值找半高交点；<code>FWHM = right - left</code>，<code>CWL = (left + right) / 2</code>。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>可以定量评价主峰位置和峰宽，而不只是凭肉眼看曲线。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>13. FWHM/CWL 增加 fallback，减少无指标 ROI</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前</span>
+            <p>如果质量曲线 <code>metric_mean_reflectance</code> 里半高交点不足，某些 ROI 会没有 CWL 和 FWHM。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>优先使用质量合格曲线计算指标；如果失败原因是找不到半高交点，则回退到完整显示曲线计算。回退成功时记录 <code>metric_status = fallback_raw_half_max</code>。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>在不隐藏曲线的前提下提高 CWL/FWHM 的可获得性，同时保留状态字段说明指标来源。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>14. 增加次峰与小峰诊断</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前</span>
+            <p>单色光场景中，只能看到曲线上的小峰，但没有量化它们相对主峰的程度。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>输出 <code>secondary_peak_wavelength_nm</code>、<code>secondary_peak_reflectance</code>、<code>secondary_peak_ratio</code> 和 <code>minor_peak_count_10pct</code>。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>可以快速判断杂峰是否只是低幅噪声，还是已经达到主峰的显著比例。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>15. Auto 5x5 自动 ROI 划分</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前</span>
+            <p>每次都需要手动画 ROI，ROI 位置和面积容易因人为操作不一致而变化。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>将图像平均分成 <code>5 x 5</code>，每个网格中心自动取一个矩形 ROI，面积为该网格面积的 <code>30%</code>。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>提供可重复的默认采样方式，便于比较整幅图不同区域的 CWL/FWHM 和反射率差异。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>16. Auto 5x5 计算改为后台并行</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前</span>
+            <p>自动生成 25 个 ROI 后，在 GUI 主线程逐个计算，窗口容易卡顿。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>使用 <code>ThreadPoolExecutor</code> 后台计算，默认最多 <code>4</code> 个 worker，并通过定时器轮询结果，完成后一次性绘制 ROI 和曲线。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>Auto 5x5 的交互卡顿明显减少，ROI 结果仍按同一套算法计算。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>17. 图像预览 Colorbar 使用全局一致范围</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前</span>
+            <p>切换不同波段时，Colorbar 可能随当前图像自动缩放，视觉亮度不便横向比较。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>从多个波段抽样估计全局预览范围，切换 band 时保持统一 <code>vmin/vmax</code>。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>图像预览更适合跨波段比较。注意这只影响显示，不改变反射率计算和导出的 CSV 数值。
+        </div>
+      </article>
+
+      <article class="item">
+        <h2>18. 完整曲线显示，不针对随机主波长写死规则</h2>
+        <div class="content">
+          <div class="before">
+            <span class="label">之前风险</span>
+            <p>如果针对 500 到 600 nm 或某个特定波长范围做特殊处理，可能在换成其他主波长数据时失效或误伤有效信号。</p>
+          </div>
+          <div class="after">
+            <span class="label">现在</span>
+            <p>算法不根据固定波长区间删除或平滑数据。主峰位置由数据本身决定，所有波长点都在曲线上显示；异常点通过原始信号 SNR、连通域和有效像素数量判断处理。</p>
+          </div>
+        </div>
+        <div class="improvement">
+          <strong>改善：</strong>更适合主波长随机变化的输入数据，不会为了某一组数据而过拟合固定波段。
+        </div>
+      </article>
+    </section>
+
+    <section class="note">
+      <strong>整体结论：</strong>
+      当前算法已经从最初的简单 <code>(Sign - Dark) / (Ref - Dark)</code>，升级为“原始差分信号降噪、负值前置归零、Signal/RefSignal 双 SNR 门限、连通域孤立点过滤、ratio-of-means ROI 统计、低质量波段质量标记、CWL/FWHM 与次峰诊断”的完整流程。核心目标不是让曲线看起来更平滑，而是从原始数据层减少低信噪比、小分母、孤立坏点造成的假峰，同时保持全波长曲线可见和质量字段可追溯。
+    </section>
+
+    <p class="small">
+      说明：GUI 布局、中文字体、Message Box 等界面优化未作为算法变化展开；它们不改变反射率、CWL 或 FWHM 的计算结果。
+    </p>
+  </main>
+</body>
+</html>
