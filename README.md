@@ -1,6 +1,6 @@
 # Spectral Calculation - 光谱重建算法项目
 
-**版本**: v1.3  
+**版本**: v1.4
 **作者**: UNS-JeromeWei  
 **日期**: 2026-06-23
 
@@ -80,10 +80,13 @@ spectral calculation/
 
 **主要功能**:
 - 读取 ENVI `.hdr/.raw` 数据目录，自动识别 `*-Rec`、`*-Ref`、`*-Dark` 数据组
-- 当前曲线和 CWL/FWHM 评估直接基于 `Sign/Rec` 信号，不再做 `Sign/Ref` 或 Dark 扣减
+- 支持三种信号处理模式，并可在 GUI 左侧按钮中实时切换：
+  - `(Sign-Dark)/(Ref-Dark)`
+  - `Sign/Ref`
+  - `Sign`，默认模式
 - 支持手动画多个矩形 ROI，并支持 `Auto 5x5` 自动 ROI 划分
-- 左侧显示 CWL drift map：每个像素取 Sign 光谱峰值对应的波长
-- 右侧显示 ROI Sign 光谱曲线，并计算 CWL、FWHM、峰值置信度、次峰比例
+- 左侧显示 CWL drift map：每个像素取当前处理模式下光谱峰值对应的波长
+- 右侧显示 ROI 光谱曲线，并按当前处理模式计算 CWL、FWHM、峰值置信度、次峰比例
 - CSV/PNG 导出 ROI 光谱、质量状态和峰值诊断指标
 - GUI 后台计算 CWL drift map，避免加载大数据时窗口无响应
 - 自动配置中文字体，避免中文路径在 GUI/PNG 中乱码
@@ -94,6 +97,7 @@ spectral calculation/
 - 当次峰接近主峰时标记为 `ambiguous_peak`，避免误判不稳定 CWL
 - CWL drift map 使用 3x3 中值滤波，并自适应保留当前数据主导峰邻域
 - Sign-only CWL map 使用快速 argmax 路径，典型加载速度约提升 5 倍
+- CSV 导出增加 `processing_mode` 和 `processing_formula`，用于记录本次 ROI 曲线采用的处理口径
 
 **运行示例**:
 ```bash
@@ -107,8 +111,13 @@ pythonw spectral_cal/roi_reflectance_eval.pyw
 
 批处理自动 5x5 ROI:
 ```bash
-python spectral_cal/roi_reflectance_eval.py --no-gui --auto-grid --output roi_signal_stats.csv
+python spectral_cal/roi_reflectance_eval.py --no-gui --auto-grid --mode sign --output roi_signal_stats.csv
 ```
+
+可选 `--mode` 参数:
+- `dark_ratio`: `(Sign-Dark)/(Ref-Dark)`
+- `sign_ref`: `Sign/Ref`
+- `sign`: `Sign`
 
 ### 3. 数学模型
 
@@ -272,6 +281,18 @@ tkinter            # GUI 文件选择
 ---
 
 ## 版本历史
+
+### v1.4 (2026-06-23)
+- **ROI GUI 增加三种处理模式**
+  - 新增 `(Sign-Dark)/(Ref-Dark)`、`Sign/Ref`、`Sign` 三个模式按钮
+  - 切换模式后自动清空旧 ROI，并按当前模式重算 CWL drift map
+  - 手动画 ROI、`Auto 5x5`、CWL、FWHM、PNG 报告、CSV 导出统一使用当前模式
+- **版本可见性增强**
+  - GUI 窗口标题显示 `ROI Signal Evaluation v1.4`
+  - 命令行运行时打印当前版本号
+- **导出可追溯**
+  - CSV 新增 `processing_mode` 和 `processing_formula`
+  - 支持命令行 `--mode` 参数复现 GUI 的三种处理口径
 
 ### v1.3 (2026-06-23)
 - **新增 ROI 信号评估 GUI**

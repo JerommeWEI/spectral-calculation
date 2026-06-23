@@ -6,7 +6,7 @@ import csv
 import math
 import re
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -41,6 +41,13 @@ DEFAULT_AUTO_WORKERS = min(4, max(1, os.cpu_count() or 1))
 DEFAULT_ARTIFACT_MIN_NM = 500.0
 DEFAULT_ARTIFACT_MAX_NM = 600.0
 DEFAULT_ARTIFACT_MODE = "mark"
+DEFAULT_PROCESSING_MODE = "sign"
+APP_VERSION = "v1.4"
+PROCESSING_MODES = {
+    "dark_ratio": "(Sign-Dark)/(Ref-Dark)",
+    "sign_ref": "Sign/Ref",
+    "sign": "Sign",
+}
 THEME_FIG_BG = "#edf1f5"
 THEME_AX_BG = "#ffffff"
 THEME_PANEL_BG = "#f8fafc"
@@ -88,6 +95,25 @@ def style_button(button: Button) -> None:
     button.label.set_fontweight("bold")
     style_control_axis(button.ax)
     button.ax.set_facecolor(THEME_BUTTON)
+
+
+def processing_label(mode: str) -> str:
+    return PROCESSING_MODES.get(mode, mode)
+
+
+def uses_reference_mode(mode: str) -> bool:
+    return mode in {"dark_ratio", "sign_ref"}
+
+
+def curve_ylabel(mode: str) -> str:
+    if mode == "sign":
+        return "Sign signal"
+    return "Ratio"
+
+
+def curve_title(mode: str, roi_count: int | None = None) -> str:
+    suffix = "" if roi_count is None else f" ({roi_count} ROI)"
+    return f"ROI mean {processing_label(mode)}{suffix}"
 
 
 def configure_gui_fonts() -> None:
@@ -162,6 +188,7 @@ class Roi:
 class ReflectanceOptions:
     eps: float
     snr: float
+    mode: str
     spatial_sigma: float
     min_valid_fraction: float
     min_division_pixels: int
@@ -414,19 +441,29 @@ def compute_reflectance(
     sign_f = sign.astype(np.float32, copy=False)
     ref_f = ref.astype(np.float32, copy=False)
     dark_f = dark.astype(np.float32, copy=False)
-    signal = sign_f
-    ref_signal = ref_f
+    if options.mode == "dark_ratio":
+        signal = sign_f - dark_f
+        ref_signal = ref_f - dark_f
+    elif options.mode == "sign_ref":
+        signal = sign_f
+        ref_signal = ref_f
+    elif options.mode == "sign":
+        signal = sign_f
+        ref_signal = ref_f
+    else:
+        raise ValueError(f"Unsupported processing mode: {options.mode}")
+    uses_ref = uses_reference_mode(options.mode)
     dark_std = float(np.std(dark_f))
     signal = maybe_spatial_gaussian(signal, options.spatial_sigma)
     ref_signal = maybe_spatial_gaussian(ref_signal, options.spatial_sigma)
     signal_threshold = max(options.eps, options.snr * dark_std)
     ref_threshold = max(options.eps, options.snr * dark_std)
     negative_signal = signal < 0
-    negative_ref_signal = np.zeros(ref_signal.shape, dtype=bool)
-    prezero = negative_signal
+    negative_ref_signal = ref_signal < 0 if uses_ref else np.zeros(ref_signal.shape, dtype=bool)
+    prezero = negative_signal | negative_ref_signal
     low_signal_snr = (~prezero) & (signal <= signal_threshold)
-    low_ref_snr = np.zeros(ref_signal.shape, dtype=bool)
-    low_snr = low_signal_snr
+    low_ref_snr = ((~prezero) & (ref_signal <= ref_threshold)) if uses_ref else np.zeros(ref_signal.shape, dtype=bool)
+    low_snr = low_signal_snr | low_ref_snr
     valid = (~prezero) & (~low_snr)
     connected_valid = remove_small_components(valid, options.min_component_pixels)
     isolated_valid = valid & (~connected_valid)
@@ -435,7 +472,10 @@ def compute_reflectance(
     out = np.full(signal.shape, np.nan, dtype=np.float32)
     out[prezero] = 0.0
     out[low_snr] = 0.0
-    out[valid] = signal[valid]
+    if uses_ref:
+        np.divide(signal, ref_signal, out=out, where=valid)
+    else:
+        out[valid] = signal[valid]
 
     low_snr_count = int(np.count_nonzero(low_snr))
     low_signal_snr_count = int(np.count_nonzero(low_signal_snr))
@@ -554,6 +594,7 @@ def compute_roi_stats(
     meta = cubes["sign"].meta
     total_pixels = roi.width * roi.height
     compute_roi, roi_slices = padded_roi(roi, meta.samples, meta.lines, options.spatial_sigma)
+    uses_ref = uses_reference_mode(options.mode)
     rows: list[dict[str, float | int | str]] = []
 
     for band_index, wavelength in enumerate(wavelengths):
@@ -570,11 +611,11 @@ def compute_roi_stats(
         signal = result.signal[roi_slices]
         ref_signal = result.ref_signal[roi_slices]
         negative_signal = signal < 0
-        negative_ref_signal = np.zeros(ref_signal.shape, dtype=bool)
-        prezero = negative_signal
+        negative_ref_signal = ref_signal < 0 if uses_ref else np.zeros(ref_signal.shape, dtype=bool)
+        prezero = negative_signal | negative_ref_signal
         low_signal_snr = (~prezero) & (signal <= result.signal_threshold)
-        low_ref_snr = np.zeros(ref_signal.shape, dtype=bool)
-        low_snr = low_signal_snr
+        low_ref_snr = ((~prezero) & (ref_signal <= result.ref_threshold)) if uses_ref else np.zeros(ref_signal.shape, dtype=bool)
+        low_snr = low_signal_snr | low_ref_snr
         valid_mask = (~prezero) & (~low_snr)
         connected_valid = remove_small_components(valid_mask, options.min_component_pixels)
         isolated_valid = valid_mask & (~connected_valid)
@@ -600,6 +641,8 @@ def compute_roi_stats(
             & (result.signal > result.signal_threshold)
             & connected_valid
         )
+        if uses_ref:
+            positive_division = positive_division & (result.ref_signal > result.ref_threshold)
         valid_count = int(np.count_nonzero(finite))
         division_count = int(np.count_nonzero(positive_division))
         valid_fraction = valid_count / total_pixels
@@ -622,7 +665,10 @@ def compute_roi_stats(
             robust_mean, robust_std, robust_min_value, robust_max_value = robust_stats(reflectance[positive_division])
             ref_signal_mean = float(np.mean(result.ref_signal[positive_division]))
             signal_mean = float(np.mean(result.signal[positive_division]))
-            raw_ratio_of_means = robust_mean
+            if uses_ref and ref_signal_mean > 0:
+                raw_ratio_of_means = signal_mean / ref_signal_mean
+            else:
+                raw_ratio_of_means = robust_mean
         elif valid_count:
             valid_values = reflectance[finite]
             raw_mean = float(np.mean(valid_values))
@@ -663,6 +709,8 @@ def compute_roi_stats(
         rows.append(
             {
                 "roi_id": roi_id,
+                "processing_mode": options.mode,
+                "processing_formula": processing_label(options.mode),
                 "band_index": band_index,
                 "wavelength_nm": float(wavelength),
                 "raw_pixel_mean_reflectance": raw_mean,
@@ -947,7 +995,7 @@ def make_preview(cubes: dict[str, CubeData], band_index: int, options: Reflectan
 def make_cwl_drift_map_cpu(cubes: dict[str, CubeData], options: ReflectanceOptions) -> np.ndarray:
     meta = cubes["sign"].meta
     wavelengths = np.array(meta.wavelengths, dtype=np.float32)
-    if meta.interleave == "bsq":
+    if options.mode == "sign" and meta.interleave == "bsq":
         sign_cube = np.asarray(cubes["sign"].data)
         peak_indices = np.argmax(sign_cube, axis=0)
         peak_signal = np.take_along_axis(sign_cube, peak_indices[None, :, :], axis=0)[0]
@@ -1008,13 +1056,30 @@ def make_cwl_drift_map_gpu(cubes: dict[str, CubeData], options: ReflectanceOptio
         dark = torch.as_tensor(np.asarray(get_band(cubes["dark"], band_index)), dtype=torch.float32, device=device)
         dark_std = torch.std(dark)
         threshold = max(options.eps, options.snr * float(dark_std.detach().cpu()))
-        signal = sign
-        ref_signal = ref
+        if options.mode == "dark_ratio":
+            signal = sign - dark
+            ref_signal = ref - dark
+        elif options.mode == "sign_ref":
+            signal = sign
+            ref_signal = ref
+        elif options.mode == "sign":
+            signal = sign
+            ref_signal = ref
+        else:
+            raise RuntimeError(f"Unsupported processing mode: {options.mode}")
+        uses_ref = uses_reference_mode(options.mode)
         prezero = signal < 0
+        if uses_ref:
+            prezero = prezero | (ref_signal < 0)
         low_snr = (~prezero) & (signal <= threshold)
+        if uses_ref:
+            low_snr = low_snr | ((~prezero) & (ref_signal <= threshold))
         valid = (~prezero) & (~low_snr)
         reflectance = torch.zeros_like(signal)
-        reflectance[valid] = signal[valid]
+        if uses_ref:
+            reflectance[valid] = signal[valid] / ref_signal[valid]
+        else:
+            reflectance[valid] = signal[valid]
         better = valid & torch.isfinite(reflectance) & (reflectance > best_reflectance)
         best_reflectance[better] = reflectance[better]
         cwl_map[better] = float(wavelength)
@@ -1139,7 +1204,7 @@ class RoiReflectanceApp:
         self.fig.subplots_adjust(bottom=0.24, wspace=0.28)
         self.fig.patch.set_facecolor(THEME_FIG_BG)
         try:
-            self.fig.canvas.manager.set_window_title("ROI Signal Evaluation")
+            self.fig.canvas.manager.set_window_title(f"ROI Signal Evaluation {APP_VERSION}")
         except AttributeError:
             pass
 
@@ -1157,15 +1222,15 @@ class RoiReflectanceApp:
         colorbar.outline.set_edgecolor(THEME_BORDER)
 
         style_plot_axis(self.ax_curve)
-        self.ax_curve.set_title("ROI mean Sign signal")
+        self.ax_curve.set_title(curve_title(self.options.mode))
         self.ax_curve.set_xlabel("Wavelength (nm)")
-        self.ax_curve.set_ylabel("Sign signal")
+        self.ax_curve.set_ylabel(curve_ylabel(self.options.mode))
         self.ax_curve.set_xlim(*self.x_limits)
         self.ax_curve.grid(True, color=THEME_GRID, alpha=0.8, linewidth=0.8)
         self.status = self.fig.text(
             0.02,
             0.03,
-            "Draw rectangles to add ROIs. Curves are computed directly from Sign/Rec.",
+            f"Draw rectangles to add ROIs. Current mode: {processing_label(self.options.mode)}.",
             fontsize=9,
             color=THEME_MUTED_TEXT,
         )
@@ -1191,6 +1256,24 @@ class RoiReflectanceApp:
         button_gap = 0.015
         button_bottom = 0.07
         button_height = 0.05
+
+        mode_left = 0.08
+        mode_width = 0.125
+        mode_gap = 0.014
+        dark_ratio_ax = self.fig.add_axes((mode_left, button_bottom, mode_width, button_height))
+        self.dark_ratio_button = Button(dark_ratio_ax, "(S-D)/(R-D)")
+        style_button(self.dark_ratio_button)
+        self.dark_ratio_button.on_clicked(lambda _event: self.on_mode_change("dark_ratio"))
+
+        sign_ref_ax = self.fig.add_axes((mode_left + mode_width + mode_gap, button_bottom, mode_width, button_height))
+        self.sign_ref_button = Button(sign_ref_ax, "Sign/Ref")
+        style_button(self.sign_ref_button)
+        self.sign_ref_button.on_clicked(lambda _event: self.on_mode_change("sign_ref"))
+
+        sign_ax = self.fig.add_axes((mode_left + 2 * (mode_width + mode_gap), button_bottom, mode_width, button_height))
+        self.sign_button = Button(sign_ax, "Sign")
+        style_button(self.sign_button)
+        self.sign_button.on_clicked(lambda _event: self.on_mode_change("sign"))
 
         load_ax = self.fig.add_axes((button_left, button_bottom, button_width, button_height))
         self.load_button = Button(load_ax, "Load Data")
@@ -1218,6 +1301,9 @@ class RoiReflectanceApp:
         self.clear_button.on_clicked(self.on_clear)
 
         for button in (
+            self.dark_ratio_button,
+            self.sign_ref_button,
+            self.sign_button,
             self.load_button,
             self.auto_button,
             self.report_button,
@@ -1226,6 +1312,7 @@ class RoiReflectanceApp:
         ):
             button.color = THEME_BUTTON
             button.hovercolor = THEME_BUTTON_HOVER
+        self.update_mode_buttons()
 
         self.selector = RectangleSelector(
             self.ax_image,
@@ -1243,7 +1330,39 @@ class RoiReflectanceApp:
         self.start_cwl_drift_job("Loading CWL drift map")
 
     def image_title(self) -> str:
-        return "CWL drift map - peak wavelength per pixel"
+        return f"CWL drift map - peak wavelength per pixel ({processing_label(self.options.mode)})"
+
+    def update_mode_buttons(self) -> None:
+        mode_buttons = {
+            "dark_ratio": self.dark_ratio_button,
+            "sign_ref": self.sign_ref_button,
+            "sign": self.sign_button,
+        }
+        for mode, button in mode_buttons.items():
+            if mode == self.options.mode:
+                button.ax.set_facecolor(THEME_BUTTON_HOVER)
+                button.label.set_color(THEME_ACCENT)
+            else:
+                button.ax.set_facecolor(THEME_BUTTON)
+                button.label.set_color(THEME_TEXT)
+
+    def on_mode_change(self, mode: str) -> None:
+        if mode == self.options.mode:
+            return
+        self.options = replace(self.options, mode=mode)
+        self.update_mode_buttons()
+        self.on_clear(None)
+        self.ax_curve.set_ylabel(curve_ylabel(self.options.mode))
+        self.ax_curve.set_title(curve_title(self.options.mode))
+        meta = self.cubes["sign"].meta
+        self.cwl_drift_map = np.full((meta.lines, meta.samples), np.nan, dtype=np.float32)
+        self.preview_limits = cwl_drift_limits(self.cwl_drift_map, self.wavelengths)
+        self.image_artist.set_data(self.cwl_drift_map)
+        self.image_artist.set_clim(*self.preview_limits)
+        self.ax_image.set_title(self.image_title())
+        self.status.set_text(f"Mode changed to {processing_label(mode)}. Recomputing CWL drift map...")
+        self.fig.canvas.draw_idle()
+        self.start_cwl_drift_job("Loading CWL drift map")
 
     def result_box_text(self) -> str:
         cwl_values = [
@@ -1465,12 +1584,12 @@ class RoiReflectanceApp:
         low_quality_count = sum(1 for row in rows if row["quality_status"] != "ok")
         self.status.set_text(
             f"Added ROI {roi_id}: x={roi.x}, y={roi.y}, width={roi.width}, height={roi.height}. "
-            f"Mean Sign range: {finite_range_text(display_means, precision=4)}. "
+            f"Mean {processing_label(self.options.mode)} range: {finite_range_text(display_means, precision=4)}. "
             f"CWL={float(cwl):.2f} nm, FWHM={float(fwhm):.2f} nm ({metrics['metric_status']}). "
             f"Confidence={float(metrics['peak_confidence']):.3f}; "
             f"Secondary peak ratio={float(metrics['secondary_peak_ratio']):.3f}; "
             f"Prezero pixels: {prezero_count}; Low-SNR excluded: {low_snr_count} "
-            f"(sign={low_signal_snr_count}); "
+            f"(signal={low_signal_snr_count}); "
             f"low-quality bands: {low_quality_count}; marked bands: {artifact_count}."
         )
         self.fig.canvas.draw_idle()
@@ -1529,7 +1648,7 @@ class RoiReflectanceApp:
         handles, labels = self.ax_curve.get_legend_handles_labels()
         unique = dict(zip(labels, handles))
         self.ax_curve.legend(unique.values(), unique.keys(), loc="best", fontsize=8)
-        self.ax_curve.set_title(f"ROI mean Sign signal ({len(self.roi_records)} ROI)")
+        self.ax_curve.set_title(curve_title(self.options.mode, len(self.roi_records)))
 
     def on_export(self, _event) -> None:
         if not self.roi_records:
@@ -1538,7 +1657,9 @@ class RoiReflectanceApp:
             return
         rows = rows_with_metrics(self.roi_records)
         write_stats_csv(rows, self.output_path)
-        self.status.set_text(f"Saved {len(self.roi_records)} ROI Sign signal CSV: {self.output_path}")
+        self.status.set_text(
+            f"Saved {len(self.roi_records)} ROI {processing_label(self.options.mode)} CSV: {self.output_path}"
+        )
         self.fig.canvas.draw_idle()
 
     def on_export_report(self, _event) -> None:
@@ -1558,7 +1679,7 @@ class RoiReflectanceApp:
             vmax=self.preview_limits[1],
         )
         fig.colorbar(image, ax=ax_image, fraction=0.046, pad=0.04, label="Peak wavelength (nm)")
-        ax_image.set_title("CWL drift map")
+        ax_image.set_title(self.image_title())
         ax_image.set_xlabel("x")
         ax_image.set_ylabel("y")
 
@@ -1586,9 +1707,9 @@ class RoiReflectanceApp:
             metrics = record.metrics
             ax_curve.axvline(float(metrics["peak_wavelength_nm"]), color=record.color, linestyle=":", linewidth=1.0)
 
-        ax_curve.set_title("ROI Sign signal")
+        ax_curve.set_title(curve_title(self.options.mode))
         ax_curve.set_xlabel("Wavelength (nm)")
-        ax_curve.set_ylabel("Sign signal")
+        ax_curve.set_ylabel(curve_ylabel(self.options.mode))
         ax_curve.set_xlim(*self.x_limits)
         ax_curve.grid(True, alpha=0.3)
         ax_quality.set_title("Division pixel fraction")
@@ -1620,9 +1741,12 @@ class RoiReflectanceApp:
         self.ax_curve.relim()
         self.ax_curve.autoscale_view()
         self.ax_curve.set_xlim(*self.x_limits)
-        self.ax_curve.set_title("ROI mean Sign signal")
+        self.ax_curve.set_title(curve_title(self.options.mode))
         self.update_result_box()
-        self.status.set_text("Cleared ROIs. Draw rectangles on the image to add new ROIs.")
+        self.status.set_text(
+            f"Cleared ROIs. Draw rectangles on the image to add new ROIs. "
+            f"Current mode: {processing_label(self.options.mode)}."
+        )
         self.fig.canvas.draw_idle()
 
     def show(self) -> None:
@@ -1632,7 +1756,7 @@ class RoiReflectanceApp:
 def load_dataset(data_dir: Path) -> dict[str, CubeData]:
     folders = find_cube_folders(data_dir)
     cubes = {
-        "sign": load_cube("Sign/Rec", folders["sign"]),
+        "sign": load_cube("Sign", folders["sign"]),
         "ref": load_cube("Ref", folders["ref"]),
         "dark": load_cube("Dark", folders["dark"]),
     }
@@ -1646,10 +1770,16 @@ def data_dir_from_cubes(cubes: dict[str, CubeData]) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate ROI Sign/Rec signal from Sign/Rec, Ref, and Dark ENVI raw cubes."
+        description="Evaluate ROI spectral signal from Sign/Rec, Ref, and Dark ENVI raw cubes."
     )
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR, help="Folder containing *-Rec, *-Ref, *-Dark")
     parser.add_argument("--output", type=Path, default=None, help="CSV path used by --no-gui or the Export CSV button")
+    parser.add_argument(
+        "--mode",
+        choices=tuple(PROCESSING_MODES.keys()),
+        default=DEFAULT_PROCESSING_MODE,
+        help="Processing formula: dark_ratio=(Sign-Dark)/(Ref-Dark), sign_ref=Sign/Ref, sign=Sign",
+    )
     parser.add_argument("--eps", type=float, default=DEFAULT_EPS, help="Absolute minimum allowed Rec/Ref signal")
     parser.add_argument("--snr", type=float, default=DEFAULT_SNR, help="Minimum Rec/Ref signal in multiples of dark std")
     parser.add_argument(
@@ -1725,6 +1855,7 @@ def main() -> None:
     options = ReflectanceOptions(
         eps=args.eps,
         snr=args.snr,
+        mode=args.mode,
         spatial_sigma=max(0.0, args.spatial_sigma),
         min_valid_fraction=args.min_valid_fraction,
         min_division_pixels=max(1, args.min_division_pixels),
@@ -1735,10 +1866,17 @@ def main() -> None:
     )
 
     print(f"Loaded data: {data_dir}")
+    print(f"Version: {APP_VERSION}")
     print(f"Shape: bands={meta.bands}, lines={meta.lines}, samples={meta.samples}")
-    print(f"Formula: Sign/Rec")
+    print(f"Formula: {processing_label(options.mode)}")
+    if options.mode == "dark_ratio":
+        gate_text = "Sign-Dark and Ref-Dark"
+    elif options.mode == "sign_ref":
+        gate_text = "Sign and Ref"
+    else:
+        gate_text = "Sign"
     print(
-        f"Processing: Sign/Rec > max({options.eps:g}, {options.snr:g} * dark_std), "
+        f"Processing: {gate_text} > max({options.eps:g}, {options.snr:g} * dark_std), "
         f"spatial sigma={options.spatial_sigma:g}, "
         f"quality division_fraction >= {options.min_valid_fraction:g} and "
         f"division pixels >= {options.min_division_pixels}, "
@@ -1775,7 +1913,7 @@ def main() -> None:
                 f"width={record.roi.width}, height={record.roi.height}, "
                 f"CWL={record.metrics['cwl_nm']}, FWHM={record.metrics['fwhm_nm']}"
             )
-        print(f"Mean Sign signal range: {finite_range_text(means, precision=6)}")
+        print(f"Mean {processing_label(options.mode)} range: {finite_range_text(means, precision=6)}")
         print(f"Saved CSV: {output_path}")
         return
 
