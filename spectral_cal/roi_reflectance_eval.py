@@ -11,6 +11,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
+import matplotlib
+
+for _mpl_backend in ("TkAgg", "QtAgg", "MacOSX", "Agg"):
+    try:
+        matplotlib.use(_mpl_backend, force=True)
+        break
+    except Exception:
+        continue
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import font_manager
@@ -38,11 +46,12 @@ DEFAULT_GRID_ROWS = 5
 DEFAULT_GRID_COLS = 5
 DEFAULT_GRID_ROI_FRACTION = 0.30
 DEFAULT_AUTO_WORKERS = min(4, max(1, os.cpu_count() or 1))
+DEFAULT_LARGE_CUBE_BYTES = 2_000_000_000
 DEFAULT_ARTIFACT_MIN_NM = 500.0
 DEFAULT_ARTIFACT_MAX_NM = 600.0
 DEFAULT_ARTIFACT_MODE = "mark"
 DEFAULT_PROCESSING_MODE = "sign"
-APP_VERSION = "v1.4"
+APP_VERSION = "v1.5"
 PROCESSING_MODES = {
     "dark_ratio": "(Sign-Dark)/(Ref-Dark)",
     "sign_ref": "Sign/Ref",
@@ -254,7 +263,7 @@ def find_first_file(folder: Path, suffix: str) -> Path:
     if not files:
         raise FileNotFoundError(f"No {suffix} file found in {folder}")
     if len(files) > 1:
-        raise ValueError(f"More than one {suffix} file found in {folder}: {files}")
+        print(f"Warning: multiple {suffix} files in {folder}; using {files[0].name}")
     return files[0]
 
 
@@ -353,10 +362,12 @@ def parse_envi_meta(folder: Path) -> EnviMeta:
 
     expected_size = header_offset + lines * samples * bands * dtype.itemsize
     actual_size = raw_path.stat().st_size
-    if expected_size != actual_size:
+    if actual_size < expected_size:
         raise ValueError(
-            f"RAW size mismatch for {raw_path}: expected {expected_size} bytes, got {actual_size} bytes"
+            f"RAW too small for {raw_path}: expected {expected_size} bytes, got {actual_size} bytes"
         )
+    if actual_size > expected_size:
+        print(f"Warning: RAW {actual_size} bytes > expected {expected_size} for {raw_path}; extra bytes ignored")
 
     if wavelengths and len(wavelengths) != bands:
         raise ValueError(
@@ -391,6 +402,12 @@ def memmap_shape(meta: EnviMeta) -> tuple[int, ...]:
 
 def load_cube(label: str, folder: Path) -> CubeData:
     meta = parse_envi_meta(folder)
+    cube_bytes = meta.lines * meta.samples * meta.bands * meta.dtype.itemsize
+    if cube_bytes > DEFAULT_LARGE_CUBE_BYTES:
+        print(
+            f"Warning: {label} cube is {cube_bytes / 1e9:.1f} GB; "
+            "in-memory steps may be slow or exhaust RAM."
+        )
     data = np.memmap(
         meta.raw_path,
         dtype=meta.dtype,
@@ -1038,6 +1055,24 @@ def make_cwl_drift_map_cpu(cubes: dict[str, CubeData], options: ReflectanceOptio
     return keep_dominant_cwl_window(smooth_cwl_map(cwl_map))
 
 
+def _torch_gaussian_kernel(sigma: float, device, dtype):
+    import torch
+
+    radius = int(4.0 * sigma + 0.5)
+    xs = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+    kernel1d = torch.exp(-(xs * xs) / (2.0 * sigma * sigma))
+    kernel1d = kernel1d / kernel1d.sum()
+    kernel2d = (kernel1d[:, None] * kernel1d[None, :])[None, None, :, :]
+    return kernel2d, radius
+
+
+def _torch_gaussian_blur(image2d, kernel2d, radius):
+    import torch.nn.functional as F
+
+    padded = F.pad(image2d[None, None, :, :], (radius, radius, radius, radius), mode="replicate")
+    return F.conv2d(padded, kernel2d)[0, 0]
+
+
 def make_cwl_drift_map_gpu(cubes: dict[str, CubeData], options: ReflectanceOptions) -> np.ndarray:
     try:
         import torch
@@ -1048,13 +1083,18 @@ def make_cwl_drift_map_gpu(cubes: dict[str, CubeData], options: ReflectanceOptio
     device = torch.device("cuda")
     meta = cubes["sign"].meta
     wavelengths = np.array(meta.wavelengths, dtype=np.float32)
+    apply_gaussian = options.spatial_sigma > 0 and not (options.mode == "sign" and meta.interleave == "bsq")
+    gaussian_kernel = None
+    gaussian_radius = 0
+    if apply_gaussian:
+        gaussian_kernel, gaussian_radius = _torch_gaussian_kernel(options.spatial_sigma, device, torch.float32)
     best_reflectance = torch.full((meta.lines, meta.samples), -float("inf"), dtype=torch.float32, device=device)
     cwl_map = torch.full((meta.lines, meta.samples), float("nan"), dtype=torch.float32, device=device)
     for band_index, wavelength in enumerate(wavelengths):
-        sign = torch.as_tensor(np.asarray(get_band(cubes["sign"], band_index)), dtype=torch.float32, device=device)
-        ref = torch.as_tensor(np.asarray(get_band(cubes["ref"], band_index)), dtype=torch.float32, device=device)
-        dark = torch.as_tensor(np.asarray(get_band(cubes["dark"], band_index)), dtype=torch.float32, device=device)
-        dark_std = torch.std(dark)
+        sign = torch.as_tensor(np.asarray(get_band(cubes["sign"], band_index)).copy(), dtype=torch.float32, device=device)
+        ref = torch.as_tensor(np.asarray(get_band(cubes["ref"], band_index)).copy(), dtype=torch.float32, device=device)
+        dark = torch.as_tensor(np.asarray(get_band(cubes["dark"], band_index)).copy(), dtype=torch.float32, device=device)
+        dark_std = torch.std(dark, correction=0)
         threshold = max(options.eps, options.snr * float(dark_std.detach().cpu()))
         if options.mode == "dark_ratio":
             signal = sign - dark
@@ -1067,6 +1107,9 @@ def make_cwl_drift_map_gpu(cubes: dict[str, CubeData], options: ReflectanceOptio
             ref_signal = ref
         else:
             raise RuntimeError(f"Unsupported processing mode: {options.mode}")
+        if gaussian_kernel is not None:
+            signal = _torch_gaussian_blur(signal, gaussian_kernel, gaussian_radius)
+            ref_signal = _torch_gaussian_blur(ref_signal, gaussian_kernel, gaussian_radius)
         uses_ref = uses_reference_mode(options.mode)
         prezero = signal < 0
         if uses_ref:
@@ -1085,16 +1128,21 @@ def make_cwl_drift_map_gpu(cubes: dict[str, CubeData], options: ReflectanceOptio
         cwl_map[better] = float(wavelength)
     cwl_map[~torch.isfinite(best_reflectance)] = float("nan")
     cwl_map[best_reflectance <= 0] = float("nan")
-    return cwl_map.detach().cpu().numpy()
+    result = cwl_map.detach().cpu().numpy()
+    del best_reflectance, cwl_map, gaussian_kernel
+    torch.cuda.empty_cache()
+    return result
 
 
 def make_cwl_drift_result(cubes: dict[str, CubeData], options: ReflectanceOptions) -> CwlDriftResult:
-    if options.spatial_sigma == 0:
-        try:
-            return CwlDriftResult(make_cwl_drift_map_gpu(cubes, options), "GPU torch CUDA")
-        except Exception:
-            pass
-    return CwlDriftResult(make_cwl_drift_map_cpu(cubes, options), "CPU")
+    gpu_error: Exception | None = None
+    try:
+        return CwlDriftResult(make_cwl_drift_map_gpu(cubes, options), "GPU torch CUDA")
+    except Exception as exc:
+        gpu_error = exc
+    cwl_map = make_cwl_drift_map_cpu(cubes, options)
+    backend = "CPU" if gpu_error is None else f"CPU (GPU unavailable: {gpu_error})"
+    return CwlDriftResult(cwl_map, backend)
 
 
 def cwl_drift_limits(cwl_map: np.ndarray, wavelengths: tuple[float, ...]) -> tuple[float, float]:
@@ -1236,7 +1284,7 @@ class RoiReflectanceApp:
         )
         self.result_box = self.fig.text(
             0.02,
-            0.13,
+            0.18,
             self.result_box_text(),
             fontsize=14,
             fontweight="bold",
@@ -1394,6 +1442,8 @@ class RoiReflectanceApp:
     def start_cwl_drift_job(self, message: str) -> None:
         self.cwl_job_id += 1
         job_id = self.cwl_job_id
+        if self.cwl_future is not None:
+            self.cwl_future.cancel()
         self.status.set_text(f"{message}... GUI remains responsive.")
         self.fig.canvas.draw_idle()
         self.cwl_future = self.executor.submit(make_cwl_drift_result, self.cubes, self.options)
@@ -1764,6 +1814,31 @@ def load_dataset(data_dir: Path) -> dict[str, CubeData]:
     return cubes
 
 
+def load_dataset_interactive(initial_dir: Path, last_error: str | None = None) -> dict[str, CubeData] | None:
+    """Prompt the user to pick a valid dataset folder when the default fails."""
+    from tkinter import Tk, filedialog, messagebox
+
+    root = Tk()
+    root.withdraw()
+    try:
+        while True:
+            if last_error:
+                messagebox.showerror("Data load failed", f"{last_error}\n\nPlease choose a valid folder.")
+            selected = filedialog.askdirectory(
+                title="Select folder containing *-Rec, *-Ref, *-Dark",
+                initialdir=str(initial_dir),
+            )
+            if not selected:
+                return None
+            try:
+                return load_dataset(Path(selected))
+            except Exception as exc:
+                last_error = f"{selected}:\n{exc}"
+                initial_dir = Path(selected).parent or Path(selected)
+    finally:
+        root.destroy()
+
+
 def data_dir_from_cubes(cubes: dict[str, CubeData]) -> Path:
     return cubes["sign"].meta.hdr_path.parent.parent
 
@@ -1842,7 +1917,14 @@ def main() -> None:
     args = parse_args()
     data_dir = resolve_data_dir(args.data_dir)
     output_path = args.output or default_output_path()
-    cubes = load_dataset(data_dir)
+    try:
+        cubes = load_dataset(data_dir)
+    except Exception as exc:
+        cubes = load_dataset_interactive(data_dir, f"{data_dir}:\n{exc}")
+        if cubes is None:
+            print(f"No data loaded ({exc}); exiting.")
+            raise SystemExit(0)
+        data_dir = data_dir_from_cubes(cubes)
     meta = cubes["sign"].meta
     rois = []
     for roi_values in args.roi or []:
