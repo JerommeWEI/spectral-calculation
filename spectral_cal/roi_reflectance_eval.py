@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import csv
+import gc
 import math
 import re
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -51,7 +52,7 @@ DEFAULT_ARTIFACT_MIN_NM = 500.0
 DEFAULT_ARTIFACT_MAX_NM = 600.0
 DEFAULT_ARTIFACT_MODE = "mark"
 DEFAULT_PROCESSING_MODE = "sign"
-APP_VERSION = "v1.5"
+APP_VERSION = "v1.6"
 PROCESSING_MODES = {
     "dark_ratio": "(Sign-Dark)/(Ref-Dark)",
     "sign_ref": "Sign/Ref",
@@ -1410,6 +1411,7 @@ class RoiReflectanceApp:
         self.ax_image.set_title(self.image_title())
         self.status.set_text(f"Mode changed to {processing_label(mode)}. Recomputing CWL drift map...")
         self.fig.canvas.draw_idle()
+        self._release_compute_resources(release_cubes=False)
         self.start_cwl_drift_job("Loading CWL drift map")
 
     def result_box_text(self) -> str:
@@ -1438,6 +1440,28 @@ class RoiReflectanceApp:
 
     def update_result_box(self) -> None:
         self.result_box.set_text(self.result_box_text())
+
+    def _release_compute_resources(self, release_cubes: bool) -> None:
+        """Cancel in-flight CWL/auto jobs and free CPU/GPU memory so that
+        repeated Load Data / mode changes stay as fast as the first run."""
+        self.cwl_job_id += 1
+        self.auto_job_id += 1
+        if self.cwl_future is not None:
+            self.cwl_future.cancel()
+            self.cwl_future = None
+        if self.auto_future is not None:
+            self.auto_future.cancel()
+            self.auto_future = None
+        if release_cubes:
+            self.cubes = None
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
 
     def start_cwl_drift_job(self, message: str) -> None:
         self.cwl_job_id += 1
@@ -1504,6 +1528,7 @@ class RoiReflectanceApp:
             self.fig.canvas.draw_idle()
             return
 
+        self._release_compute_resources(release_cubes=True)
         self.cubes = new_cubes
         self.data_dir = Path(selected)
         self.wavelengths = new_cubes["sign"].meta.wavelengths
