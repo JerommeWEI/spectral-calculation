@@ -23,6 +23,7 @@ for _mpl_backend in ("TkAgg", "QtAgg", "MacOSX", "Agg"):
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import font_manager
+from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 from matplotlib.text import Text
 from matplotlib.widgets import Button, RectangleSelector
@@ -45,14 +46,14 @@ DEFAULT_CWL_MEDIAN_FILTER_SIZE = 3
 DEFAULT_CWL_DOMINANT_WINDOW_NM = 24.0
 DEFAULT_GRID_ROWS = 5
 DEFAULT_GRID_COLS = 5
-DEFAULT_GRID_ROI_FRACTION = 0.30
+DEFAULT_GRID_ROI_SIZE = 50
 DEFAULT_AUTO_WORKERS = min(4, max(1, os.cpu_count() or 1))
 DEFAULT_LARGE_CUBE_BYTES = 2_000_000_000
 DEFAULT_ARTIFACT_MIN_NM = 500.0
 DEFAULT_ARTIFACT_MAX_NM = 600.0
 DEFAULT_ARTIFACT_MODE = "mark"
 DEFAULT_PROCESSING_MODE = "sign"
-APP_VERSION = "v1.6"
+APP_VERSION = "v1.7"
 PROCESSING_MODES = {
     "dark_ratio": "(Sign-Dark)/(Ref-Dark)",
     "sign_ref": "Sign/Ref",
@@ -251,6 +252,7 @@ class RoiRecord:
     color: str
     patch: Rectangle | None
     label: Text | None
+    curve: Line2D | None
 
 
 @dataclass(frozen=True)
@@ -546,9 +548,8 @@ def auto_grid_rois(
     lines: int,
     rows: int = DEFAULT_GRID_ROWS,
     cols: int = DEFAULT_GRID_COLS,
-    area_fraction: float = DEFAULT_GRID_ROI_FRACTION,
+    roi_size: int = DEFAULT_GRID_ROI_SIZE,
 ) -> list[Roi]:
-    scale = math.sqrt(max(0.0, min(1.0, area_fraction)))
     x_edges = np.linspace(0, samples, cols + 1)
     y_edges = np.linspace(0, lines, rows + 1)
     rois: list[Roi] = []
@@ -560,8 +561,8 @@ def auto_grid_rois(
             y1 = int(round(y_edges[row + 1]))
             block_width = max(1, x1 - x0)
             block_height = max(1, y1 - y0)
-            roi_width = max(1, int(round(block_width * scale)))
-            roi_height = max(1, int(round(block_height * scale)))
+            roi_width = max(1, int(roi_size))
+            roi_height = max(1, int(roi_size))
             roi_x = x0 + (block_width - roi_width) // 2
             roi_y = y0 + (block_height - roi_height) // 2
             rois.append(clamp_roi(Roi(roi_x, roi_y, roi_width, roi_height), samples=samples, lines=lines))
@@ -1208,9 +1209,9 @@ def plot_roi_reflectance_curve(
     label: str | None = None,
     linewidth: float = 1.4,
     markersize: float = 3.0,
-) -> None:
+) -> Line2D:
     x = np.array(wavelengths, dtype=float)
-    ax.plot(
+    (line,) = ax.plot(
         x,
         display_means,
         marker="o",
@@ -1219,6 +1220,7 @@ def plot_roi_reflectance_curve(
         label=label,
         color=color,
     )
+    return line
 
 
 class RoiReflectanceApp:
@@ -1235,6 +1237,8 @@ class RoiReflectanceApp:
         self.output_path = output_path
         self.data_dir = data_dir
         self.roi_records: list[RoiRecord] = []
+        self.selected_roi_ids: set[int] = set()
+        self.patch_to_roi_id: dict[Rectangle, int] = {}
         self.executor = ThreadPoolExecutor(max_workers=DEFAULT_AUTO_WORKERS)
         self.auto_future: Future[list[tuple[int, Roi, list[dict[str, float | int | str]], dict[str, float | str], str]]] | None = None
         self.cwl_future: Future[CwlDriftResult] | None = None
@@ -1373,6 +1377,8 @@ class RoiReflectanceApp:
             spancoords="pixels",
             interactive=True,
         )
+        self.fig.canvas.mpl_connect("pick_event", self.on_pick)
+        self.fig.canvas.mpl_connect("key_press_event", self.on_key)
 
         if initial_roi is not None:
             self.add_roi(initial_roi)
@@ -1573,7 +1579,7 @@ class RoiReflectanceApp:
             lines=meta.lines,
             rows=DEFAULT_GRID_ROWS,
             cols=DEFAULT_GRID_COLS,
-            area_fraction=DEFAULT_GRID_ROI_FRACTION,
+            roi_size=DEFAULT_GRID_ROI_SIZE,
         )
         self.auto_job_id += 1
         job_id = self.auto_job_id
@@ -1638,7 +1644,7 @@ class RoiReflectanceApp:
         self.update_result_box()
         self.status.set_text(
             f"Added {len(results)} automatic ROIs: {DEFAULT_GRID_ROWS}x{DEFAULT_GRID_COLS}, "
-            f"each ROI area is {DEFAULT_GRID_ROI_FRACTION:.0%} of its grid block."
+            f"each ROI is {DEFAULT_GRID_ROI_SIZE}x{DEFAULT_GRID_ROI_SIZE} px."
         )
         self.fig.canvas.draw_idle()
 
@@ -1686,7 +1692,9 @@ class RoiReflectanceApp:
             edgecolor=color,
             linewidth=1.8,
         )
+        patch.set_picker(True)
         self.ax_image.add_patch(patch)
+        self.patch_to_roi_id[patch] = roi_id
         label = self.ax_image.text(
             roi.x,
             max(0, roi.y - 4),
@@ -1696,10 +1704,6 @@ class RoiReflectanceApp:
             weight="bold",
             bbox={"facecolor": "white", "alpha": 0.65, "edgecolor": "none", "pad": 1},
         )
-        self.roi_records.append(
-            RoiRecord(roi_id=roi_id, roi=roi, rows=rows, metrics=metrics, color=color, patch=patch, label=label)
-        )
-        self.selector.extents = (roi.x, roi.x1, roi.y, roi.y1)
         fwhm = metrics["fwhm_nm"]
         cwl = metrics["cwl_nm"]
         if np.isfinite(float(fwhm)) and np.isfinite(float(cwl)):
@@ -1707,7 +1711,7 @@ class RoiReflectanceApp:
         else:
             curve_label = f"ROI {roi_id}"
         metric_means = np.array([row["metric_mean_reflectance"] for row in rows], dtype=float)
-        plot_roi_reflectance_curve(
+        curve = plot_roi_reflectance_curve(
             self.ax_curve,
             self.wavelengths,
             display_means,
@@ -1715,6 +1719,19 @@ class RoiReflectanceApp:
             color,
             label=curve_label,
         )
+        self.roi_records.append(
+            RoiRecord(
+                roi_id=roi_id,
+                roi=roi,
+                rows=rows,
+                metrics=metrics,
+                color=color,
+                patch=patch,
+                label=label,
+                curve=curve,
+            )
+        )
+        self.selector.extents = (roi.x, roi.x1, roi.y, roi.y1)
 
     def finalize_roi_plot(self) -> None:
         self.ax_curve.relim()
@@ -1799,6 +1816,65 @@ class RoiReflectanceApp:
         self.status.set_text(f"Saved ROI report PNG: {report_path}")
         self.fig.canvas.draw_idle()
 
+    def apply_roi_highlight(self, record: RoiRecord, selected: bool) -> None:
+        if record.patch is None:
+            return
+        if selected:
+            record.patch.set_linewidth(3.6)
+            record.patch.set_fill(True)
+            record.patch.set_facecolor(record.color)
+            record.patch.set_alpha(0.30)
+        else:
+            record.patch.set_linewidth(1.8)
+            record.patch.set_fill(False)
+            record.patch.set_alpha(1.0)
+
+    def on_pick(self, event) -> None:
+        roi_id = self.patch_to_roi_id.get(event.artist)
+        if roi_id is None:
+            return
+        record = next((r for r in self.roi_records if r.roi_id == roi_id), None)
+        if record is None:
+            return
+        if roi_id in self.selected_roi_ids:
+            self.selected_roi_ids.discard(roi_id)
+            self.apply_roi_highlight(record, False)
+            self.status.set_text(f"Unselected ROI {roi_id}. Selected: {sorted(self.selected_roi_ids)}.")
+        else:
+            self.selected_roi_ids.add(roi_id)
+            self.apply_roi_highlight(record, True)
+            self.status.set_text(
+                f"Selected ROI {roi_id}. Press Delete to remove. Selected: {sorted(self.selected_roi_ids)}."
+            )
+        self.fig.canvas.draw_idle()
+
+    def on_key(self, event) -> None:
+        if event.key != "delete":
+            return
+        if not self.selected_roi_ids:
+            return
+        removed = sorted(self.selected_roi_ids)
+        for roi_id in removed:
+            self.remove_roi(roi_id)
+        self.finalize_roi_plot()
+        self.update_result_box()
+        self.status.set_text(f"Removed ROI {removed}. Remaining ROIs: {len(self.roi_records)}.")
+        self.fig.canvas.draw_idle()
+
+    def remove_roi(self, roi_id: int) -> None:
+        index = next((i for i, r in enumerate(self.roi_records) if r.roi_id == roi_id), None)
+        if index is None:
+            return
+        record = self.roi_records.pop(index)
+        if record.patch is not None:
+            self.patch_to_roi_id.pop(record.patch, None)
+            record.patch.remove()
+        if record.label is not None:
+            record.label.remove()
+        if record.curve is not None:
+            record.curve.remove()
+        self.selected_roi_ids.discard(roi_id)
+
     def on_clear(self, _event) -> None:
         self.auto_job_id += 1
         for record in self.roi_records:
@@ -1812,6 +1888,8 @@ class RoiReflectanceApp:
         if legend is not None:
             legend.remove()
         self.roi_records.clear()
+        self.selected_roi_ids.clear()
+        self.patch_to_roi_id.clear()
         self.next_roi_id = 1
         self.ax_curve.relim()
         self.ax_curve.autoscale_view()
@@ -1931,7 +2009,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--auto-grid",
         action="store_true",
-        help="Use the default 5x5 automatic ROI grid; each ROI covers 30 percent of its block",
+        help="Use the default 5x5 automatic ROI grid; each ROI is 50x50 pixels",
     )
     parser.add_argument("--no-gui", action="store_true", help="Compute --roi and write CSV without opening the GUI")
     return parser.parse_args()
